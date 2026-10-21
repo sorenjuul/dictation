@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-cqzEo6lzyLZzcEg/v2jlzUECQ5MCkWiASAlhew6dV2c='; style-src 'sha256-DTKvKxa7LXZhsGNSAi9etj3sFSvMPcaE3Do2MMpas10='; connect-src https://ntfy.sh; base-uri 'none'; form-action 'none'">
+<title>RDP Dictation</title>
+<style>*{box-sizing:border-box}
+body{margin:0;font:17px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:#0d1117;color:#e6edf3}
+header{display:flex;justify-content:space-between;align-items:center;padding:14px 18px;border-bottom:1px solid #222c37;font-weight:600}
+header small{font-weight:400;color:#7ee2a8}
+main{max-width:640px;margin:0 auto;padding:18px}
+textarea{width:100%;min-height:9em;padding:12px;border-radius:12px;border:1px solid #2d3a47;background:#111822;color:inherit;font:inherit;resize:vertical}
+.row{display:flex;gap:10px;margin-top:12px}
+button{flex:1;padding:15px;border-radius:12px;border:1px solid #2d3a47;background:#18222d;color:inherit;font:inherit;font-weight:600}
+button.primary{background:#1f6feb;border-color:#1f6feb;color:#fff}
+button:disabled{opacity:.45}
+button.link{flex:none;display:block;margin:28px auto 0;padding:6px;border:none;background:none;color:#8b98a5;font-weight:400;text-decoration:underline}
+#status{margin-top:12px;min-height:1.5em;color:#9fb0c0}
+p{color:#c4ced8}</style>
+</head>
+<body>
+<header><span>RDP Dictation</span><small>end-to-end encrypted</small></header>
+<main>
+<section id="unpaired" hidden>
+<p id="unpairedText">This phone is not paired yet. On the remote PC, run pair-phone.cmd and scan the QR code with this phone.</p>
+</section>
+<section id="paired" hidden>
+<textarea id="txt" placeholder="Tap here, press the microphone on your keyboard, and speak."></textarea>
+<div class="row"><button id="send" class="primary" disabled>Send</button><button id="sendEnter" disabled>Send + Enter</button></div>
+<div id="status" role="status">Connecting to the relay...</div>
+<button id="forget" class="link">Unpair this phone</button>
+</section>
+</main>
+<script>(() => {
+'use strict';
+const RELAY = 'https://ntfy.sh';
+const LABEL = 'rdp-dictation/v1/';
+const STORE = 'rdp-dictation.key';
+const ACK_TIMEOUT_MS = 10000;
+const CHUNK_BYTES = 1500;
+const te = new TextEncoder(), td = new TextDecoder();
+const $ = id => document.getElementById(id);
+const status = t => { $('status').textContent = t; };
+const b64uEnc = bytes => { let s = ''; for (const b of bytes) s += String.fromCharCode(b); return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, ''); };
+const b64uDec = s => { s = s.replace(/-/g, '+').replace(/_/g, '/'); s += '='.repeat((4 - s.length % 4) % 4); return Uint8Array.from(atob(s), c => c.charCodeAt(0)); };
+const hex = bytes => Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+
+// The key arrives once in the URL fragment (#k=...), which browsers never send to any server.
+function takeKey() {
+  const m = location.hash.match(/(?:^#|&)k=([A-Za-z0-9_-]{43})(?:&|$)/);
+  if (m) {
+    localStorage.setItem(STORE, m[1]);
+    history.replaceState(null, '', location.pathname + location.search);
+  }
+  return localStorage.getItem(STORE);
+}
+
+async function setup(keyB64) {
+  const hk = await crypto.subtle.importKey('raw', b64uDec(keyB64), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const derive = async label => new Uint8Array(await crypto.subtle.sign('HMAC', hk, te.encode(LABEL + label)));
+  return {
+    aes: await crypto.subtle.importKey('raw', await derive('aes'), 'AES-GCM', false, ['encrypt', 'decrypt']),
+    toPc: 'rd-' + hex(await derive('topic/to-pc')).slice(0, 32),
+    toPhone: 'rd-' + hex(await derive('topic/to-phone')).slice(0, 32),
+  };
+}
+
+async function encrypt(s, obj) {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv, additionalData: te.encode(LABEL + 'to-pc') }, s.aes, te.encode(JSON.stringify(obj))));
+  return 'v1.' + b64uEnc(iv) + '.' + b64uEnc(ct);
+}
+
+async function decrypt(s, body) {
+  const p = body.split('.');
+  if (p.length !== 3 || p[0] !== 'v1') return null;
+  try {
+    const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: b64uDec(p[1]), additionalData: te.encode(LABEL + 'to-phone') }, s.aes, b64uDec(p[2]));
+    return JSON.parse(td.decode(pt));
+  } catch { return null; }
+}
+
+// Keep each encrypted message well under ntfy's 4096-byte limit, so it is never turned into a stored attachment.
+function chunks(text) {
+  const out = [];
+  let cur = '', bytes = 0;
+  for (const ch of text) {
+    const n = te.encode(ch).length;
+    if (bytes + n > CHUNK_BYTES && cur) { out.push(cur); cur = ''; bytes = 0; }
+    cur += ch; bytes += n;
+  }
+  if (cur) out.push(cur);
+  return out;
+}
+
+const pending = new Map();
+let connected = false, sending = false;
+const refresh = () => { $('send').disabled = $('sendEnter').disabled = !connected || sending; };
+
+function waitForReceipt(id) {
+  return new Promise(resolve => {
+    const timer = setTimeout(() => { pending.delete(id); resolve(null); }, ACK_TIMEOUT_MS);
+    pending.set(id, { resolve, timer });
+  });
+}
+
+function listenForReceipts(s) {
+  const es = new EventSource(RELAY + '/' + s.toPhone + '/sse');
+  es.onopen = () => { connected = true; refresh(); if (!sending) status('Connected. Ready.'); };
+  es.onerror = () => { connected = false; refresh(); status('Connecting to the relay...'); };
+  es.onmessage = async e => {
+    let m;
+    try { m = JSON.parse(e.data); } catch { return; }
+    if (m.event !== 'message' || typeof m.message !== 'string') return;
+    const r = await decrypt(s, m.message);
+    if (!r || typeof r.ack !== 'string') return;
+    const p = pending.get(r.ack);
+    if (p) { pending.delete(r.ack); clearTimeout(p.timer); p.resolve(r); }
+  };
+}
+
+async function send(s, withEnter) {
+  const text = $('txt').value.trim();
+  if (!text) return;
+  sending = true; refresh();
+  const parts = chunks(withEnter ? text : text + ' ');
+  let receipt = null;
+  for (let i = 0; i < parts.length; i++) {
+    status(parts.length > 1 ? 'Sending part ' + (i + 1) + ' of ' + parts.length + '...' : 'Sending...');
+    const id = b64uEnc(crypto.getRandomValues(new Uint8Array(12)));
+    const msg = { id, ts: Date.now(), text: parts[i], enter: withEnter && i === parts.length - 1 };
+    const waiting = waitForReceipt(id);
+    try {
+      const r = await fetch(RELAY + '/' + s.toPc, { method: 'POST', headers: { 'X-Cache': 'no', 'X-Firebase': 'no' }, body: await encrypt(s, msg) });
+      if (!r.ok) throw new Error('relay answered HTTP ' + r.status);
+    } catch (err) {
+      const p = pending.get(id);
+      if (p) { clearTimeout(p.timer); pending.delete(id); }
+      status('Could not reach the relay (' + err.message + '). Nothing was typed.');
+      sending = false; refresh();
+      return;
+    }
+    receipt = await waiting;
+    if (!receipt) {
+      status(i === 0
+        ? 'No answer from the PC. Is start-dictation.cmd running? Nothing was stored, so just send again.'
+        : 'Only ' + i + ' of ' + parts.length + ' parts were typed before the PC stopped answering.');
+      sending = false; refresh();
+      return;
+    }
+  }
+  $('txt').value = '';
+  status('Typed into: ' + (receipt.fg || 'the focused window'));
+  sending = false; refresh();
+}
+
+(async () => {
+  if (!window.isSecureContext || !window.crypto || !crypto.subtle) {
+    $('unpaired').hidden = false;
+    $('unpairedText').textContent = 'This page must be opened over https.';
+    return;
+  }
+  const key = takeKey();
+  if (!key) { $('unpaired').hidden = false; return; }
+  const s = await setup(key);
+  $('paired').hidden = false;
+  refresh();
+  listenForReceipts(s);
+  $('send').addEventListener('click', () => send(s, false));
+  $('sendEnter').addEventListener('click', () => send(s, true));
+  $('forget').addEventListener('click', () => { localStorage.removeItem(STORE); location.reload(); });
+})();
+})();</script>
+</body>
+</html>
